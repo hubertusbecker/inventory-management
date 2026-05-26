@@ -80,6 +80,7 @@ class Order(BaseModel):
     actual_delivery: Optional[str] = None
     warehouse: Optional[str] = None
     category: Optional[str] = None
+    order_type: Optional[str] = None  # "customer" | "restocking"
 
 class DemandForecast(BaseModel):
     id: str
@@ -120,6 +121,11 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class CreateOrderRequest(BaseModel):
+    items: List[dict]  # [{sku, name, quantity, unit_price}]
+    warehouse: Optional[str] = None
+    order_type: Optional[str] = "restocking"
+
 # API endpoints
 @app.get("/")
 def root():
@@ -152,6 +158,65 @@ def get_orders(
     filtered_orders = apply_filters(orders, warehouse, category, status)
     filtered_orders = filter_by_month(filtered_orders, month)
     return filtered_orders
+
+@app.post("/api/orders", response_model=Order)
+def create_order(order_request: CreateOrderRequest):
+    """Create a new restocking order"""
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    expected = now + timedelta(days=14)
+    new_id = str(max(int(o["id"]) for o in orders) + 1) if orders else "1"
+    restocking_count = sum(1 for o in orders if o.get("order_type") == "restocking")
+    new_order = {
+        "id": new_id,
+        "order_number": f"RST-{now.year}-{restocking_count + 1:04d}",
+        "customer": "Factory Restocking",
+        "items": order_request.items,
+        "status": "Processing",
+        "order_date": now.isoformat(),
+        "expected_delivery": expected.isoformat(),
+        "total_value": round(sum(i["quantity"] * i["unit_price"] for i in order_request.items), 2),
+        "warehouse": order_request.warehouse or "All Warehouses",
+        "category": None,
+        "order_type": order_request.order_type or "restocking",
+        "actual_delivery": None,
+    }
+    orders.append(new_order)
+    return new_order
+
+@app.get("/api/restocking/recommendations")
+def get_restocking_recommendations(budget: Optional[float] = None):
+    """Get restocking recommendations from demand forecasts, sorted by demand gap"""
+    inventory_map = {item["sku"]: item for item in inventory_items}
+    recommendations = []
+    for forecast in demand_forecasts:
+        if forecast["trend"] != "increasing":
+            continue
+        inv = inventory_map.get(forecast["item_sku"])
+        if not inv:
+            continue
+        quantity = forecast["forecasted_demand"]
+        unit_cost = inv["unit_cost"]
+        recommendations.append({
+            "sku": forecast["item_sku"],
+            "name": forecast["item_name"],
+            "current_demand": forecast["current_demand"],
+            "forecasted_demand": forecast["forecasted_demand"],
+            "demand_gap": forecast["forecasted_demand"] - forecast["current_demand"],
+            "quantity": quantity,
+            "unit_cost": unit_cost,
+            "total_cost": round(quantity * unit_cost, 2),
+            "warehouse": inv["warehouse"],
+            "category": inv["category"],
+        })
+    recommendations.sort(key=lambda x: x["demand_gap"], reverse=True)
+    if budget is not None:
+        remaining = budget
+        for rec in recommendations:
+            rec["fits_budget"] = remaining >= rec["total_cost"]
+            if rec["fits_budget"]:
+                remaining -= rec["total_cost"]
+    return recommendations
 
 @app.get("/api/orders/{order_id}", response_model=Order)
 def get_order(order_id: str):
